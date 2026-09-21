@@ -108,21 +108,26 @@ collection = client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
-def index_file(filepath):
+def index_file(filepath, user_id):
     """
-    Indexes a file into Chroma. Returns the number of chunks indexed.
-    Returns 0 if the file's content is an exact duplicate of content
-    already indexed under a different filename (nothing new indexed).
+    Indexes a file into Chroma, scoped to a specific user. Returns the
+    number of chunks indexed. Returns 0 if this exact content already
+    exists under a different filename for the SAME user (duplicate
+    check is per-user — one user's content hash should never be
+    compared against another user's, since that would both leak
+    whether another user has a given file and risk false-positive
+    skips across accounts that should be fully isolated).
     """
     raw_text = load_text(filepath)
     filename = os.path.basename(filepath)
     content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
 
-    # Skip indexing if this exact content already exists under a
-    # *different* source filename (cheap exact-duplicate guard; does
-    # not catch near-duplicates or paraphrased content — that's a
-    # later, smarter-RAG improvement).
-    existing = collection.get(where={"content_hash": content_hash})
+    # Duplicate check scoped to this user only — $and combines both
+    # conditions, since Chroma's `where` only ANDs top-level keys
+    # implicitly in some versions; being explicit avoids ambiguity.
+    existing = collection.get(where={
+        "$and": [{"content_hash": content_hash}, {"user_id": user_id}]
+    })
     if existing["ids"] and not all(
         meta.get("source") == filename for meta in existing["metadatas"]
     ):
@@ -131,12 +136,22 @@ def index_file(filepath):
     chunks = chunk_text(raw_text, chunk_size=500, overlap=50)
     embeddings = embedder.encode(chunks).tolist()
 
-    # Remove any existing chunks for this filename before re-indexing,
-    # so a shorter re-upload doesn't leave orphaned old chunks behind.
-    collection.delete(where={"source": filename})
+    # Remove any existing chunks for THIS filename AND THIS user before
+    # re-indexing. Without the user_id here, one user re-uploading a
+    # file could wipe out another user's identically-named file.
+    collection.delete(where={
+        "$and": [{"source": filename}, {"user_id": user_id}]
+    })
 
-    ids = [f"{filename}_{i}" for i in range(len(chunks))]
-    metadatas = [{"source": filename, "content_hash": content_hash} for _ in chunks]
+    # user_id is baked into the chunk ID itself, not just the metadata.
+    # This is what actually prevents two different users' same-named
+    # files from colliding on the same Chroma ID and overwriting each
+    # other via upsert.
+    ids = [f"user{user_id}_{filename}_{i}" for i in range(len(chunks))]
+    metadatas = [
+        {"source": filename, "content_hash": content_hash, "user_id": user_id}
+        for _ in chunks
+    ]
 
     collection.upsert(
         ids=ids,
@@ -146,15 +161,22 @@ def index_file(filepath):
     )
     return len(chunks)
 
-def retrieve(query, top_k=3, source_filter=None, max_distance=1.0):
+def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=1.0):
     query_embedding = embedder.encode(query).tolist()
+
+    # user_id filtering is never optional — every retrieval must be
+    # scoped to the requesting user's own documents. source_filter is
+    # an additional, optional narrowing on top of that (a specific
+    # file within this user's own documents).
+    where_conditions = [{"user_id": user_id}]
+    if source_filter:
+        where_conditions.append({"source": source_filter})
 
     query_kwargs = {
         "query_embeddings": [query_embedding],
         "n_results": top_k,
+        "where": {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0],
     }
-    if source_filter:
-        query_kwargs["where"] = {"source": source_filter}
 
     results = collection.query(**query_kwargs)
     matched_chunks = results["documents"][0]
@@ -326,11 +348,17 @@ def upload():
     if ext not in ALLOWED_EXTENSIONS:
         return jsonify({"error": f"Unsupported file type: {ext}"}), 400
 
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    # Each user's uploads live in their own subfolder, keyed by user ID.
+    # Without this, two users uploading a same-named file would silently
+    # overwrite each other's physical file on disk, even after Chroma
+    # itself is correctly isolated by user_id.
+    user_upload_folder = os.path.join(UPLOAD_FOLDER, str(current_user.id))
+    os.makedirs(user_upload_folder, exist_ok=True)
+    filepath = os.path.join(user_upload_folder, filename)
     file.save(filepath)
 
     try:
-        num_chunks = index_file(filepath)
+        num_chunks = index_file(filepath, current_user.id)
     except Exception as e:
         return jsonify({"error": f"Failed to index file: {str(e)}"}), 500
 
@@ -346,9 +374,9 @@ def upload():
 @app.route("/documents", methods=["GET"])
 @login_required
 def list_documents():
-    # Chroma has no built-in "distinct values" query, so pull all metadata
-    # and de-duplicate in Python. Fine at small/demo scale.
-    all_items = collection.get()
+    # Only pull metadata belonging to the current user — otherwise this
+    # would list every user's filenames mixed together.
+    all_items = collection.get(where={"user_id": current_user.id})
     sources = set()
     for meta in all_items["metadatas"]:
         if meta and "source" in meta:
@@ -362,18 +390,20 @@ def delete_document(filename):
     # upload — filename comes from the URL, which is user-controlled.
     filename = secure_filename(filename)
 
-    # Remove all chunks tagged with this source from the vector database.
-    existing = collection.get(where={"source": filename})
+    where_clause = {"$and": [{"source": filename}, {"user_id": current_user.id}]}
+
+    # Remove all chunks tagged with this source AND belonging to this
+    # user — without the user_id condition, this would also match (and
+    # delete) another user's identically-named file.
+    existing = collection.get(where=where_clause)
     if not existing["ids"]:
         return jsonify({"error": f"No indexed document found named '{filename}'."}), 404
 
-    collection.delete(where={"source": filename})
+    collection.delete(where=where_clause)
 
-    # Also remove the physical file from disk, so it doesn't linger and
-    # doesn't get accidentally re-served or re-indexed later. Missing on
-    # disk (e.g. already removed manually) is not treated as a failure —
-    # the important part (removing it from search) already succeeded.
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    # Physical files now also live in a per-user subfolder (see /upload),
+    # so this can never touch another user's file of the same name.
+    filepath = os.path.join(UPLOAD_FOLDER, str(current_user.id), filename)
     if os.path.exists(filepath):
         os.remove(filepath)
 
@@ -477,7 +507,7 @@ def ask():
 
     try:
         history = get_recent_history(conversation.id)
-        results = retrieve(query, top_k=3, source_filter=source_filter)
+        results = retrieve(query, current_user.id, top_k=3, source_filter=source_filter)
         if not results:
             return jsonify({"error": "No indexed documents match that filter, or no results were relevant enough."}), 400
 
