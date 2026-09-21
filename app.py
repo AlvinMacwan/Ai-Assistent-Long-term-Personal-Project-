@@ -6,13 +6,15 @@ import requests
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
+from docx import Document as DocxDocument
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 from flask_login import (
     LoginManager, login_user, logout_user, login_required, current_user
 )
+from flask_migrate import Migrate
 
-from models import db, User, Message
+from models import db, User, Message, Conversation
 
 load_dotenv()  # loads variables from a local .env file into the environment
 
@@ -28,8 +30,12 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-this"
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///app.db"
 db.init_app(app)
 
-with app.app_context():
-    db.create_all()
+# --- Migrations (Step 1 of V3's proper schema handling) ---
+# From now on, schema changes go through migration files instead of
+# db.create_all(). create_all() only adds brand-new tables and never
+# modifies existing ones — Migrate lets us evolve the schema (add
+# columns, change types, add tables) without ever deleting real data.
+migrate = Migrate(app, db)
 
 # --- Login setup (Step 2 of V2) ---
 login_manager = LoginManager()
@@ -46,14 +52,17 @@ def load_user(user_id):
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".txt", ".pdf"}
+ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".md"}
 
 # ==========================================
 # RAG pipeline
 # ==========================================
 def load_text(filepath):
     ext = os.path.splitext(filepath)[1].lower()
-    if ext == ".txt":
+    if ext in (".txt", ".md"):
+        # Markdown is just plain text with formatting symbols (#, *, etc.)
+        # left in place — no special parsing needed for this to work
+        # fine as retrievable content; the symbols just sit in the text.
         with open(filepath, "r", encoding="utf-8") as f:
             return f.read()
     elif ext == ".pdf":
@@ -63,6 +72,13 @@ def load_text(filepath):
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
+        return text
+    elif ext == ".docx":
+        # .docx files are internally a zip of XML files. python-docx
+        # handles that structure for us; we just walk the paragraphs
+        # and join their text, same as the PDF page loop above.
+        doc = DocxDocument(filepath)
+        text = "\n".join(p.text for p in doc.paragraphs if p.text)
         return text
     else:
         raise ValueError(f"Unsupported file type: {ext}")
@@ -363,22 +379,104 @@ def delete_document(filename):
 
     return jsonify({"message": f"Deleted '{filename}' and its indexed chunks."})
 
+@app.route("/conversations", methods=["GET"])
+@login_required
+def list_conversations():
+    # Ownership is enforced right in the query itself (filter_by user_id),
+    # not checked afterward — a user can only ever see their own rows
+    # come back from this query in the first place.
+    conversations = (
+        Conversation.query
+        .filter_by(user_id=current_user.id)
+        .order_by(Conversation.created_at.desc())
+        .all()
+    )
+    return jsonify({
+        "conversations": [
+            {"id": c.id, "title": c.title, "created_at": c.created_at.isoformat()}
+            for c in conversations
+        ]
+    })
+
+
+@app.route("/conversations", methods=["POST"])
+@login_required
+def create_conversation():
+    conversation = Conversation(user_id=current_user.id, title="New conversation")
+    db.session.add(conversation)
+    db.session.commit()
+    return jsonify({"id": conversation.id, "title": conversation.title})
+
+
+@app.route("/conversations/<int:conversation_id>/messages", methods=["GET"])
+@login_required
+def get_conversation_messages(conversation_id):
+    # Explicit ownership check: fetch the conversation filtered by BOTH
+    # its id AND the current user's id. If it exists but belongs to
+    # someone else, this returns None just like it doesn't exist at all
+    # — the requester can't tell the difference, which is the correct,
+    # safe behavior (never reveal "that exists, but isn't yours").
+    conversation = Conversation.query.filter_by(
+        id=conversation_id, user_id=current_user.id
+    ).first()
+    if conversation is None:
+        return jsonify({"error": "Conversation not found."}), 404
+
+    return jsonify({
+        "id": conversation.id,
+        "title": conversation.title,
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "sources": json.loads(m.sources_json) if m.sources_json else None,
+            }
+            for m in conversation.messages  # already ordered by created_at via the model's relationship
+        ],
+    })
+
+
+@app.route("/conversations/<int:conversation_id>", methods=["DELETE"])
+@login_required
+def delete_conversation(conversation_id):
+    conversation = Conversation.query.filter_by(
+        id=conversation_id, user_id=current_user.id
+    ).first()
+    if conversation is None:
+        return jsonify({"error": "Conversation not found."}), 404
+
+    # The cascade="all, delete-orphan" set on Conversation.messages in
+    # models.py means deleting this row also deletes all its Message
+    # rows automatically — no need to manually delete them first.
+    db.session.delete(conversation)
+    db.session.commit()
+    return jsonify({"message": "Conversation deleted."})
+
+
 @app.route("/ask", methods=["POST"])
 @login_required
 def ask():
     data = request.get_json()
     query = data.get("question", "")
     source_filter = data.get("source") or None  # empty string -> None (no filter)
+    conversation_id = data.get("conversation_id")
 
     if not query:
         return jsonify({"error": "No question provided"}), 400
+    if not conversation_id:
+        return jsonify({"error": "No conversation_id provided."}), 400
 
-    # Single ongoing conversation per user, for now (V2 scope) — derived
-    # deterministically from the user's ID rather than stored separately.
-    conversation_id = f"user_{current_user.id}_main"
+    # Same ownership check as the other conversation routes — never trust
+    # a conversation_id from the request body without verifying it's
+    # actually this user's conversation.
+    conversation = Conversation.query.filter_by(
+        id=conversation_id, user_id=current_user.id
+    ).first()
+    if conversation is None:
+        return jsonify({"error": "Conversation not found."}), 404
 
     try:
-        history = get_recent_history(conversation_id)
+        history = get_recent_history(conversation.id)
         results = retrieve(query, top_k=3, source_filter=source_filter)
         if not results:
             return jsonify({"error": "No indexed documents match that filter, or no results were relevant enough."}), 400
@@ -387,17 +485,24 @@ def ask():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    # Auto-title the conversation from its first question, so the
+    # sidebar shows something meaningful instead of "New conversation"
+    # for every entry. Only do this once — check via the default title,
+    # so later messages in the same conversation don't keep overwriting it.
+    if conversation.title == "New conversation":
+        conversation.title = (query[:40] + "...") if len(query) > 40 else query
+
     # Persist this turn (both sides) so it's available as history on the
     # next question in this conversation.
     user_msg = Message(
         user_id=current_user.id,
-        conversation_id=conversation_id,
+        conversation_id=conversation.id,
         role="user",
         content=query,
     )
     assistant_msg = Message(
         user_id=current_user.id,
-        conversation_id=conversation_id,
+        conversation_id=conversation.id,
         role="assistant",
         content=answer,
         sources_json=jsonify_sources(results),
