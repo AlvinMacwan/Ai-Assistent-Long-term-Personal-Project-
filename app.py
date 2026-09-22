@@ -1,10 +1,12 @@
 import os
+import re
 import hashlib
 import json
 import chromadb
 import requests
+from rank_bm25 import BM25Okapi
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from dotenv import load_dotenv
@@ -66,6 +68,13 @@ ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".md"}
 # documents suggests the gap has shifted.
 RELEVANCE_THRESHOLD = 0.8
 
+# How many candidates to pull from Chroma before reranking. This needs
+# to be meaningfully larger than top_k so the cross-encoder actually has
+# room to promote a chunk the bi-encoder ranked outside the final cut.
+# If a user's document set has fewer total chunks than this, Chroma just
+# returns everything it has — not an error.
+RERANK_CANDIDATE_POOL = 20
+
 # ==========================================
 # RAG pipeline
 # ==========================================
@@ -114,11 +123,110 @@ def chunk_text(text, chunk_size=500, overlap=50):
     return [c for c in chunks if c]
 
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Cross-encoder used to rerank the retrieved candidate pool. Unlike the
+# bi-encoder above (which embeds query and chunk separately, then
+# compares vectors — fast, used for the initial Chroma search), the
+# cross-encoder takes the query and a chunk together as one input and
+# outputs a single relevance score straight from that joint comparison.
+# More accurate, but too slow to run against the whole collection —
+# hence: bi-encoder for broad retrieval, cross-encoder for reranking a
+# small shortlist.
+reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
 client = chromadb.PersistentClient(path="./chroma_webapp_db")
 collection = client.get_or_create_collection(
     name="webapp_documents",
     metadata={"hnsw:space": "cosine"}
 )
+
+# ==========================================
+# BM25 keyword search (hybrid search, alongside vector search)
+# ==========================================
+# Vector search (via Chroma above) is good at semantic similarity but
+# can miss exact-term matches — acronyms, proper nouns, specific
+# numbers — since embeddings capture meaning, not exact tokens. BM25
+# is the opposite: strong on exact keyword matches, no notion of
+# meaning. Running both and merging their candidates (see retrieve()
+# below) gives semantic recall AND exact-match precision.
+#
+# Unlike Chroma, rank_bm25's BM25Okapi isn't a live index you insert
+# into — it's built once from a full corpus and has to be rebuilt
+# whenever that corpus changes. So we keep a plain in-memory list
+# mirroring what's in Chroma, and rebuild the BM25 index whenever a
+# document is added or removed.
+bm25_corpus = []   # list of {"text": ..., "user_id": ..., "source": ...}
+bm25_index = None  # rebuilt by _rebuild_bm25_index() whenever bm25_corpus changes
+
+
+def _tokenize(text):
+    # Simple lowercase word-splitting — enough for BM25's term-matching
+    # purposes here; no stemming/lemmatization needed at this scale.
+    return re.findall(r"\w+", text.lower())
+
+
+def _rebuild_bm25_index():
+    global bm25_index
+    if bm25_corpus:
+        bm25_index = BM25Okapi([_tokenize(item["text"]) for item in bm25_corpus])
+    else:
+        bm25_index = None
+
+
+def _load_bm25_corpus_from_chroma():
+    # Chroma is persistent on disk; this in-memory bm25_corpus list is
+    # not, so on every app startup we rebuild it from whatever's
+    # already indexed in Chroma to keep the two in sync.
+    global bm25_corpus
+    all_items = collection.get()
+    bm25_corpus = [
+        {"text": doc, "user_id": meta.get("user_id"), "source": meta.get("source")}
+        for doc, meta in zip(all_items["documents"], all_items["metadatas"])
+    ]
+    _rebuild_bm25_index()
+
+
+def _bm25_remove_entries(user_id, filename):
+    # Mirrors collection.delete(where={"source": filename, "user_id": user_id})
+    # — call this alongside that, so the two indexes never drift apart.
+    global bm25_corpus
+    bm25_corpus = [
+        item for item in bm25_corpus
+        if not (item["user_id"] == user_id and item["source"] == filename)
+    ]
+
+
+def _bm25_add_entries(chunks, user_id, filename):
+    # Mirrors collection.upsert(...) — call this alongside that.
+    for chunk in chunks:
+        bm25_corpus.append({"text": chunk, "user_id": user_id, "source": filename})
+
+
+def bm25_search(query, user_id, source_filter=None, top_n=None):
+    """
+    Keyword search scoped to a user's own documents, same isolation
+    guarantee as retrieve()'s vector search. Returns a list of
+    (chunk_text, source) tuples, ranked by BM25 score (higher = more
+    relevant) — no distance metric, since BM25 scores aren't
+    comparable to cosine distance.
+    """
+    if bm25_index is None or not bm25_corpus:
+        return []
+
+    if top_n is None:
+        top_n = RERANK_CANDIDATE_POOL
+
+    scores = bm25_index.get_scores(_tokenize(query))
+    scored = [
+        (score, item) for score, item in zip(scores, bm25_corpus)
+        if item["user_id"] == user_id and (source_filter is None or item["source"] == source_filter)
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [(item["text"], item["source"]) for _, item in scored[:top_n]]
+
+
+_load_bm25_corpus_from_chroma()
+
 
 def index_file(filepath, user_id):
     """
@@ -154,6 +262,9 @@ def index_file(filepath, user_id):
     collection.delete(where={
         "$and": [{"source": filename}, {"user_id": user_id}]
     })
+    # Mirror the same removal in the BM25 corpus, so a re-upload doesn't
+    # leave stale duplicate entries sitting alongside the fresh ones.
+    _bm25_remove_entries(user_id, filename)
 
     # user_id is baked into the chunk ID itself, not just the metadata.
     # This is what actually prevents two different users' same-named
@@ -171,9 +282,17 @@ def index_file(filepath, user_id):
         documents=chunks,
         metadatas=metadatas,
     )
+
+    # Mirror the same chunks into the BM25 corpus and rebuild its index
+    # — BM25Okapi has no incremental "add one doc" operation, so any
+    # corpus change means a full rebuild. Fine at this document scale.
+    _bm25_add_entries(chunks, user_id, filename)
+    _rebuild_bm25_index()
+
     return len(chunks)
 
-def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=RELEVANCE_THRESHOLD):
+def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=RELEVANCE_THRESHOLD,
+             candidate_pool=RERANK_CANDIDATE_POOL):
     query_embedding = embedder.encode(query).tolist()
 
     # user_id filtering is never optional — every retrieval must be
@@ -186,7 +305,11 @@ def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=RELEVANCE
 
     query_kwargs = {
         "query_embeddings": [query_embedding],
-        "n_results": top_k,
+        # Over-fetch relative to top_k: pull a wider candidate pool than
+        # we'll actually return, so the cross-encoder below has real
+        # alternatives to promote instead of just re-sorting the same
+        # top_k the bi-encoder already picked.
+        "n_results": candidate_pool,
         "where": {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0],
     }
 
@@ -197,13 +320,57 @@ def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=RELEVANCE
 
     # Drop chunks that are too semantically distant to be useful context.
     # See RELEVANCE_THRESHOLD's definition above for the reasoning
-    # behind the default value.
-    filtered = [
+    # behind the default value. This filter runs on the wider candidate
+    # pool, same as it used to run on the final top_k — just more chunks
+    # to check now.
+    vector_candidates = [
         (d, c, m.get("source", "unknown"))
         for d, c, m in zip(distances, matched_chunks, metadatas)
         if d <= max_distance
     ]
-    return filtered
+
+    # --- Hybrid search: bring in BM25 keyword matches (NEW) ---
+    # Vector search can miss chunks that share no semantic "shape" with
+    # the query but do contain its exact terms (acronyms, proper nouns,
+    # specific numbers) — BM25 catches those. We don't threshold-filter
+    # BM25 hits the way we do vector hits, since BM25 scores aren't on
+    # the same 0-2 cosine-distance scale; instead we let the reranker
+    # below judge relevance for every candidate, vector- or
+    # keyword-sourced, using one consistent signal.
+    bm25_matches = bm25_search(query, user_id, source_filter=source_filter, top_n=candidate_pool)
+
+    # Union + dedupe by chunk text. Vector candidates already carry a
+    # real cosine distance; BM25-only matches (found by keyword search
+    # but absent from the vector search's own candidate pool) get
+    # distance=None, since there's no cosine distance to report for a
+    # chunk the vector search never actually surfaced.
+    seen_chunks = {c for _, c, _ in vector_candidates}
+    combined = list(vector_candidates)
+    for chunk_text, source in bm25_matches:
+        if chunk_text not in seen_chunks:
+            combined.append((None, chunk_text, source))
+            seen_chunks.add(chunk_text)
+
+    if not combined:
+        return []
+
+    # --- Reranking ---
+    # Score each surviving (query, chunk) pair with the cross-encoder.
+    # Higher score = more relevant. This re-sorts the candidate pool
+    # using a query-aware signal the bi-encoder's cosine distance can't
+    # provide, then we cut down to top_k only after reranking.
+    pairs = [(query, chunk) for _, chunk, _ in combined]
+    rerank_scores = reranker.predict(pairs)
+
+    reranked = sorted(zip(combined, rerank_scores), key=lambda pair: pair[1], reverse=True)
+
+    # Drop the rerank score before returning — keeps the return shape
+    # identical to before ((distance, chunk, source) tuples, distance
+    # possibly None for BM25-only matches), so generate_answer() and
+    # the /ask route keep working with only the small None-handling
+    # tweak made to jsonify_sources() and the chunks_payload below.
+    top_results = [item for item, score in reranked[:top_k]]
+    return top_results
 
 def jsonify_sources(retrieved_chunks):
     """
@@ -214,7 +381,14 @@ def jsonify_sources(retrieved_chunks):
     back out later for display (source citations feature).
     """
     return json.dumps([
-        {"distance": round(distance, 4), "text": chunk, "source": source}
+        {
+            # distance is None for chunks found only via BM25 keyword
+            # search (no cosine distance exists for those), so guard
+            # the round() call rather than let it crash on None.
+            "distance": round(distance, 4) if distance is not None else None,
+            "text": chunk,
+            "source": source,
+        }
         for distance, chunk, source in retrieved_chunks
     ])
 
@@ -274,15 +448,15 @@ Question: {query}"""
             # non-answers, inconsistent refusal behavior) even with zero
             # code changes between runs. Pinning trades "always whatever's
             # available" for consistent, known behavior.
-            # Verified live directly from openrouter.ai/collections/free-models
-            # (search snippets proved unreliable — two earlier picks were
-            # already discontinued/invalid by the time tested). This is
-            # the #1 most-used free model on that page by real token
-            # volume (4.75T tokens), suggesting it's well-tested and
-            # reliably available, not just technically free.
-            # NOTE: free model availability changes often — if this ID
-            # ever errors as unavailable, re-check that URL directly.
-            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+            # Switched from nvidia/nemotron-3-ultra-550b-a55b:free to
+            # Qwen's free-tier model. Verified live on openrouter.ai
+            # (compare page returns real metrics, not "no endpoints
+            # found") — free, 262K context.
+            # NOTE: free model availability changes often, and this
+            # project has already hit the openrouter daily free-tier
+            # rate limit once — if this ID ever errors as unavailable
+            # or rate-limited, re-check openrouter.ai/models directly.
+            "model": "qwen/qwen3.8-27b:free",
             "messages": [{"role": "user", "content": prompt}]
         }
     )
@@ -428,6 +602,12 @@ def delete_document(filename):
 
     collection.delete(where=where_clause)
 
+    # Mirror the same removal in the BM25 corpus — otherwise a deleted
+    # document would still surface via keyword search even though
+    # vector search (and the UI's document list) no longer sees it.
+    _bm25_remove_entries(current_user.id, filename)
+    _rebuild_bm25_index()
+
     # Physical files now also live in a per-user subfolder (see /upload),
     # so this can never touch another user's file of the same name.
     filepath = os.path.join(UPLOAD_FOLDER, str(current_user.id), filename)
@@ -570,7 +750,13 @@ def ask():
 
     # Return retrieved chunks alongside the answer, for transparency in the UI
     chunks_payload = [
-        {"distance": round(distance, 4), "text": chunk, "source": source}
+        {
+            # Same None-guard as jsonify_sources() — BM25-only matches
+            # have no cosine distance to report.
+            "distance": round(distance, 4) if distance is not None else None,
+            "text": chunk,
+            "source": source,
+        }
         for distance, chunk, source in results
     ]
 
@@ -588,4 +774,4 @@ def ask():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True) 

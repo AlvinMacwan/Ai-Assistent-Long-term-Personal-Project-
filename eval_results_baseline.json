@@ -2,55 +2,44 @@
   {
     "id": 1,
     "question": "When did modern AI research formally begin?",
-    "passed": true,
-    "keyword_hit": true,
-    "source_ok": true,
-    "answer": "Modern AI research formally began in 1956 at a workshop held at Dartmouth College.",
-    "sources": [
-      "test_document.txt"
-    ],
+    "passed": false,
+    "keyword_hit": false,
+    "source_ok": false,
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    "sources": [],
     "noise_sources": [],
     "conversation_id": 6
   },
   {
     "id": 2,
     "question": "What is RAG?",
-    "passed": true,
-    "keyword_hit": true,
-    "source_ok": true,
-    "answer": "Based on the context provided, RAG (Retrieval-Augmented Generation) is a system that retrieves relevant information from an external knowledge source at query time and provides it as context to a language model. Rather than relying solely on what the model memorized during training, RAG allows the system to answer questions using up-to-date or domain-specific information without retraining the underlying model.\n\nThe context also describes the typical RAG pipeline: documents are broken into chunks, each chunk is converted into a numerical vector representation (embedding) that captures semantic meaning, and these embeddings are stored in a vector database for fast similarity search when a user asks a question.",
-    "sources": [
-      "test_document.txt",
-      "test_notes.md"
-    ],
-    "noise_sources": [
-      "test_notes.md"
-    ],
+    "passed": false,
+    "keyword_hit": false,
+    "source_ok": false,
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    "sources": [],
+    "noise_sources": [],
     "conversation_id": 7
   },
   {
     "id": 3,
     "question": "What algorithm does Chroma use for fast approximate similarity search?",
-    "passed": true,
-    "keyword_hit": true,
-    "source_ok": true,
-    "answer": "Based on the provided context, I don't know specifically what algorithm Chroma uses. The context states that \"most vector databases use approximate nearest neighbor algorithms, such as HNSW (Hierarchical Navigable Small World graphs)\" but doesn't explicitly confirm which algorithm Chroma specifically employs.",
-    "sources": [
-      "test_vectordb.docx"
-    ],
+    "passed": false,
+    "keyword_hit": false,
+    "source_ok": false,
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    "sources": [],
     "noise_sources": [],
     "conversation_id": 8
   },
   {
     "id": 4,
     "question": "Name two vector database options besides Chroma.",
-    "passed": true,
-    "keyword_hit": true,
-    "source_ok": true,
-    "answer": "Based on the context, two vector database options besides Chroma are **Pinecone** and **Weaviate** (Milvus is also mentioned as another option).",
-    "sources": [
-      "test_vectordb.docx"
-    ],
+    "passed": false,
+    "keyword_hit": false,
+    "source_ok": false,
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    "sources": [],
     "noise_sources": [],
     "conversation_id": 9
   },
@@ -68,13 +57,11 @@
   {
     "id": 6,
     "question": "What's the difference between zero-shot and few-shot prompting?",
-    "passed": true,
-    "keyword_hit": true,
-    "source_ok": true,
-    "answer": "Based on the context provided:\n\n**Zero-shot prompting** involves asking the model to perform a task with no examples\u2014it relies purely on the instruction itself.\n\n**Few-shot prompting** involves providing a handful of example input-output pairs before the actual question, which helps the model infer the expected format and style.",
-    "sources": [
-      "test_notes.md"
-    ],
+    "passed": false,
+    "keyword_hit": false,
+    "source_ok": false,
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+    "sources": [],
     "noise_sources": [],
     "conversation_id": 11
   },
@@ -92,10 +79,10 @@
   {
     "id": 8,
     "question": "What is the capital of France?",
-    "passed": true,
-    "keyword_hit": true,
+    "passed": false,
+    "keyword_hit": false,
     "source_ok": true,
-    "answer": "[ERROR] No indexed documents match that filter, or no results were relevant enough.",
+    "answer": "[ERROR] Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
     "sources": [],
     "noise_sources": [],
     "conversation_id": 13
