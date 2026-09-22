@@ -13,3 +13,6 @@ chroma_webapp_db/
 
 instance/
 test files/
+
+run_eval.py
+eval_set.json

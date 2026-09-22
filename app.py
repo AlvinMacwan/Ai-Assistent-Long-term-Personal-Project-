@@ -54,6 +54,18 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx", ".md"}
 
+# Cosine distance cutoff for retrieval relevance. Chunks with a distance
+# above this are dropped rather than passed to the LLM as context.
+# Value chosen from real observed data across our own eval runs: every
+# genuinely relevant chunk we've seen sits below ~0.8, while every
+# confirmed-irrelevant chunk sits above ~0.92 — this threshold sits in
+# that gap. Previously set to 1.0 (effectively no filtering), which let
+# irrelevant chunks reach the LLM and contributed to at least one
+# observed hallucination on an out-of-scope question. Re-tune this by
+# re-running eval_set.json / run_eval.py if retrieval quality on new
+# documents suggests the gap has shifted.
+RELEVANCE_THRESHOLD = 0.8
+
 # ==========================================
 # RAG pipeline
 # ==========================================
@@ -161,7 +173,7 @@ def index_file(filepath, user_id):
     )
     return len(chunks)
 
-def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=1.0):
+def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=RELEVANCE_THRESHOLD):
     query_embedding = embedder.encode(query).tolist()
 
     # user_id filtering is never optional — every retrieval must be
@@ -184,8 +196,8 @@ def retrieve(query, user_id, top_k=3, source_filter=None, max_distance=1.0):
     metadatas = results["metadatas"][0]  # carries the "source" filename per chunk
 
     # Drop chunks that are too semantically distant to be useful context.
-    # max_distance is a loose starting cutoff for cosine distance — tune
-    # it once you've seen how it behaves on real queries.
+    # See RELEVANCE_THRESHOLD's definition above for the reasoning
+    # behind the default value.
     filtered = [
         (d, c, m.get("source", "unknown"))
         for d, c, m in zip(distances, matched_chunks, metadatas)
@@ -255,7 +267,22 @@ Question: {query}"""
             "Content-Type": "application/json",
         },
         json={
-            "model": "openrouter/free",
+            # Pinned to a specific model rather than the "openrouter/free"
+            # wildcard router. openrouter/free selects a DIFFERENT
+            # underlying free model at random per request, which is why
+            # eval runs showed inconsistent behavior (occasional garbled
+            # non-answers, inconsistent refusal behavior) even with zero
+            # code changes between runs. Pinning trades "always whatever's
+            # available" for consistent, known behavior.
+            # Verified live directly from openrouter.ai/collections/free-models
+            # (search snippets proved unreliable — two earlier picks were
+            # already discontinued/invalid by the time tested). This is
+            # the #1 most-used free model on that page by real token
+            # volume (4.75T tokens), suggesting it's well-tested and
+            # reliably available, not just technically free.
+            # NOTE: free model availability changes often — if this ID
+            # ever errors as unavailable, re-check that URL directly.
+            "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
             "messages": [{"role": "user", "content": prompt}]
         }
     )
